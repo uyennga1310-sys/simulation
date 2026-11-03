@@ -48,3 +48,9 @@ Không xem kết quả TX/RX riêng là đã được xác minh: chế độ qu�
 ## Kiểm tra đã thực hiện
 
 `python3 -m unittest discover -s tests -v`: kiểm tra dải quét, dữ liệu không hợp lệ, công thức skin depth, phân biệt vật liệu và tạo một setup cho mỗi tần số. Đây là kiểm tra offline; không xác minh COM API, import CAD, mesh hay kết quả vật lý trên Ansys 2021 R1. Cần chạy thực tế trên máy có AEDT và hình học của bạn.
+
+## File demo chạy trước khi có thông số
+
+Dùng **`ECT_PCB_DEMO_2021R1.py` → Tools → Run Script**. File này độc lập, không cần `.x_t`, không yêu cầu điền tên khối. Nó dựng vòng đồng vuông một vòng (ngoài 4×4 mm, đường đồng rộng 0,3 mm, dày 0,035 mm), FR4 5×5×0,8 mm, mẫu nhôm 8×8×0,5 mm, lift-off 1 mm và terminal. Mặc định tự validate và giải một điểm 100 kHz, 0,1 A. Đây là mô hình mẫu không khuyết tật, không phải hình học cảm biến thực của bạn.
+
+Project lưu vào thư mục tạm Windows; đường dẫn được ghi trong Message Manager, có thể dùng Save As để chuyển tới vị trí mong muốn. Khi đã có thông số, đổi hình học/tham số và bật dải quét thích hợp. File demo đã kiểm tra cú pháp và sinh lệnh hình học offline; chưa chạy xác minh trên AEDT 2021 R1.
