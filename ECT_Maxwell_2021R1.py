@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# ANSYS Electronics Desktop 2021 R1 - Maxwell 3D Transient
+# ANSYS Electronics Desktop 2021 R1 - Maxwell 3D Eddy Current / Transient
 # Printed ECT sensor starter automation
 #
 # Run from: AEDT -> Tools -> Run Script...
@@ -18,6 +18,8 @@
 
 import os
 import re
+import math
+import datetime
 import System
 import clr
 
@@ -28,15 +30,26 @@ from System.Windows.Forms import (OpenFileDialog, DialogResult, Form, Label,
 # ------------------------- USER SETTINGS -------------------------
 
 PROJECT_NAME = "Printed_ECT_Maxwell"
-DESIGN_NAME = "ECT_PCB_Transient"
+SCRIPT_VERSION = "PCB-FREQ-2021R1-1"
+SOLUTION_TYPE = "EddyCurrent"  # Frequency-domain; alternative: "Transient".
+DESIGN_NAME = "ECT_PCB_Frequency"
+# Proposed range, NOT specified by the slides. Each point adapts its own mesh.
+SWEEP_START_HZ = 1e4
+SWEEP_STOP_HZ = 1e6
+SWEEP_POINTS = 9
+# Current amplitude convention follows AEDT's selected solver, no implicit RMS conversion.
+ADAPTIVE_PERCENT_ERROR = 1.0
+MAX_ADAPTIVE_PASSES = 10
+COPPER_THICKNESS_MM = 0.035  # EXAMPLE ONLY; replace with actual PCB stackup.
+MESH_DIVISIONS_PER_SKIN_DEPTH = 2.0
 
 MODEL_UNITS = "mm"
 
 # Example excitation settings; replace with measured operating conditions.
 FREQ_HZ = 100000.0
 CURRENT_PEAK_A = 0.1
-STOP_TIME = "50us"       # 5 cycles at 100 kHz
-TIME_STEP = "0.1us"      # 100 time steps per cycle
+TRANSIENT_CYCLES = 10
+TRANSIENT_STEPS_PER_CYCLE = 100
 AUTO_SOLVE = False       # Inspect geometry, terminals and mesh before enabling.
 OUTPUT_DIRECTORY = ""   # Empty: save beside imported geometry; never overwrite.
 RX_TERMINAL_SHEETS = []  # Optional open-circuit pickup coil cross-section sheets.
@@ -60,7 +73,8 @@ C45_CONDUCTIVITY = "4e6"
 MATERIAL_OBJECTS = {
     "copper": [],
     "FR4_epoxy": [],
-    "C45": []
+    "C45": [],
+    "aluminum": []
 }
 
 # Coil terminal must be a SHEET created by cutting the TX copper conductor
@@ -70,8 +84,8 @@ TX_TERMINAL_SHEETS = []
 
 # Initial mesh limits only. Resolve actual copper thickness and specimen skin
 # depth with a convergence study; 0.50 mm in steel may be too coarse at 100 kHz.
-COPPER_MAX_LENGTH = "0.10mm"
-STEEL_MAX_LENGTH = "0.50mm"
+COPPER_MAX_LENGTH = "0.03mm"  # PPT baseline; tightened for skin depth/thickness.
+STEEL_MAX_LENGTH = "0.03mm"  # Tightened at highest analyzed frequency.
 
 # Region padding around imported sensor/specimen geometry.
 REGION_PADDING_PERCENT = 100
@@ -80,7 +94,14 @@ REGION_PADDING_PERCENT = 100
 # ------------------------- HELPERS -------------------------
 
 def log(message):
-    print("[ECT SETUP] " + str(message))
+    text = "[ECT " + SCRIPT_VERSION + "] " + str(message)
+    print(text)
+    desktop = globals().get("oDesktop")
+    if desktop is not None:
+        try:
+            desktop.AddMessage("", "", 0, text)
+        except Exception:
+            pass  # Logging must not hide the original setup/solver error.
 
 def assign_material(editor, object_names, material_name):
     if not object_names:
@@ -133,8 +154,10 @@ def detect_material(name, imported_material):
         candidates.add("copper")
     if material in ("fr4", "fr4_epoxy") or tokens & set(["fr4", "substrate", "dielectric"]):
         candidates.add("FR4_epoxy")
-    if material == "c45" or tokens & set(["c45", "specimen", "sample"]):
+    if material == "c45" or tokens & set(["c45"]):
         candidates.add("C45")
+    if material == "aluminum" or tokens & set(["aluminum", "aluminium", "al2024"]):
+        candidates.add("aluminum")
     return list(candidates)[0] if len(candidates) == 1 else None
 
 
@@ -150,9 +173,9 @@ def populate_mapping(editor, solids, sheets):
             imported_material = ""
         role = detect_material(obj, imported_material)
         if role is None:
-            role = choose_role(obj, ["copper", "FR4_epoxy", "C45"],
+            role = choose_role(obj, ["copper", "FR4_epoxy", "C45", "aluminum"],
                 "Select the actual material. Copper = PCB conductors; "
-                "FR4 = substrate; C45 = steel specimen. "
+                "FR4 = substrate; C45 = steel; aluminum = aluminum specimen. "
                 "If this is another part, cancel and configure its material separately.")
         MATERIAL_OBJECTS[role].append(obj)
         log("Material mapping: " + obj + " -> " + role)
@@ -181,6 +204,43 @@ def populate_mapping(editor, solids, sheets):
                         "Export/include the terminal sheet in the CAD input before rerunning.")
 
 
+def frequency_points(start, stop, count):
+    if any(math.isnan(float(v)) or math.isinf(float(v)) for v in (start, stop, count)):
+        raise ValueError("Frequency settings must be finite")
+    if start <= 0 or stop < start or count < 1 or int(count) != count:
+        raise ValueError("Invalid frequency range/count")
+    if count == 1:
+        if start != stop:
+            raise ValueError("One point requires identical start and stop")
+        return [float(start)]
+    return [start * (stop / float(start)) ** (i / float(count - 1))
+            for i in range(int(count))]
+
+
+def skin_depth_mm(frequency, relative_mu, conductivity):
+    if min(frequency, relative_mu, conductivity) <= 0:
+        raise ValueError("Skin-depth inputs must be positive")
+    return 1000.0 / math.sqrt(math.pi * frequency *
+                            (4e-7 * math.pi) * relative_mu * conductivity)
+
+
+def insert_frequency_setups(analysis, frequencies):
+    names = []
+    for index, frequency in enumerate(frequencies):
+        name = "Freq_" + str(index + 1).zfill(3)
+        analysis.InsertSetup("EddyCurrent", [
+            "NAME:" + name, "Enabled:=", True,
+            "MaximumPasses:=", MAX_ADAPTIVE_PASSES,
+            "MinimumPasses:=", 2, "MinimumConvergedPasses:=", 2,
+            "PercentRefinement:=", 30,
+            "PercentError:=", ADAPTIVE_PERCENT_ERROR,
+            "SolveFieldOnly:=", False,
+            "Frequency:=", "%.12gHz" % frequency,
+            "HasSweepSetup:=", False])
+        names.append(name)
+    return names
+
+
 def assign_winding(boundary, name, sheets, current, point_out):
     # Maxwell 3D transient: sheet coil terminals belong to a winding.
     boundary.AssignWindingGroup(
@@ -204,6 +264,15 @@ try:
     import ScriptEnv
     ScriptEnv.Initialize("Ansoft.ElectronicsDesktop")
     oDesktop.RestoreWindow()
+    oDesktop.AddMessage("", "", 0, "ECT script version: " + SCRIPT_VERSION)
+    if SOLUTION_TYPE not in ("EddyCurrent", "Transient"):
+        raise ValueError("Unsupported SOLUTION_TYPE")
+    frequencies = frequency_points(SWEEP_START_HZ, SWEEP_STOP_HZ, SWEEP_POINTS)
+    if min(FREQ_HZ, CURRENT_PEAK_A, COPPER_THICKNESS_MM,
+           MESH_DIVISIONS_PER_SKIN_DEPTH, TRANSIENT_CYCLES,
+           TRANSIENT_STEPS_PER_CYCLE) <= 0:
+        raise ValueError("Frequency, current and copper thickness must be positive")
+    highest_frequency = max(frequencies) if SOLUTION_TYPE == "EddyCurrent" else FREQ_HZ
 
     # Choose Parasolid file
     dlg = OpenFileDialog()
@@ -224,7 +293,7 @@ try:
 
     # Create project/design
     oProject = oDesktop.NewProject()
-    oProject.InsertDesign("Maxwell 3D", DESIGN_NAME, "Transient", "")
+    oProject.InsertDesign("Maxwell 3D", DESIGN_NAME, SOLUTION_TYPE, "")
     oDesign = oProject.SetActiveDesign(DESIGN_NAME)
     oEditor = oDesign.SetActiveEditor("3D Modeler")
     oEditor.SetModelUnits(
@@ -268,8 +337,8 @@ try:
     if not solid_names:
         raise Exception("No solids imported. Check Parasolid version/units.")
     populate_mapping(oEditor, solid_names, sheet_names)
-    if not MATERIAL_OBJECTS["copper"] or not MATERIAL_OBJECTS["C45"]:
-        raise Exception("Mapping must include copper conductors and a C45 specimen. "
+    if not MATERIAL_OBJECTS["copper"] or not (MATERIAL_OBJECTS["C45"] or MATERIAL_OBJECTS["aluminum"]):
+        raise Exception("Mapping must include copper conductors and a C45 or aluminum specimen. "
                         "Check the selected roles and imported geometry.")
     if not TX_TERMINAL_SHEETS:
         raise Exception("No TX cross-section sheet selected. A valid TX terminal is required.")
@@ -292,22 +361,26 @@ try:
     if unmapped:
         raise Exception("Map all imported solids before solving: " + ", ".join(sorted(unmapped)))
 
+    # Local, explicit materials avoid reliance on installed library spelling.
+    # Assumptions, not measured values from the slides. C45 remains linear.
     definitions = oProject.GetDefinitionManager()
-    if not definitions.DoesMaterialExist("C45"):
-        definitions.AddMaterial(
-            ["NAME:C45", "CoordinateSystemType:=", "Cartesian",
-             "BulkOrSurfaceType:=", 1,
-             ["NAME:PhysicsTypes", "set:=", ["Electromagnetic"]],
-             "permeability:=", C45_RELATIVE_MU,
-             "conductivity:=", C45_CONDUCTIVITY])
-    for material in ("copper", "FR4_epoxy"):
-        if MATERIAL_OBJECTS[material] and not definitions.DoesMaterialExist(material):
-            raise Exception("Required material unavailable in project/library: " + material)
-
-    # Assign materials only to explicitly configured objects.
-    assign_material(oEditor, MATERIAL_OBJECTS["copper"], "copper")
-    assign_material(oEditor, MATERIAL_OBJECTS["FR4_epoxy"], "FR4_epoxy")
-    assign_material(oEditor, MATERIAL_OBJECTS["C45"], "C45")
+    properties = {
+        "copper": ("1", "5.8e7", "1"),
+        "FR4_epoxy": ("1", "0", "4.4"),
+        "C45": (C45_RELATIVE_MU, C45_CONDUCTIVITY, "1"),
+        "aluminum": ("1", "3.5e7", "1")}
+    for key, objects in MATERIAL_OBJECTS.items():
+        if not objects:
+            continue
+        mu, sigma, epsilon = properties[key]
+        material_name = "ECT_" + key
+        definitions.AddMaterial([
+            "NAME:" + material_name, "CoordinateSystemType:=", "Cartesian",
+            "BulkOrSurfaceType:=", 1,
+            ["NAME:PhysicsTypes", "set:=", ["Electromagnetic"]],
+            "permeability:=", mu, "conductivity:=", sigma,
+            "permittivity:=", epsilon])
+        assign_material(oEditor, objects, material_name)
 
     # AEDT percentage padding uses numeric values and per-direction types.
     region_parameters = ["NAME:RegionParameters"]
@@ -322,18 +395,32 @@ try:
          "SolveInside:=", True])
 
     oBoundary = oDesign.GetModule("BoundarySetup")
-    assign_winding(oBoundary, "TX_Winding", TX_TERMINAL_SHEETS,
-        str(CURRENT_PEAK_A) + "A*sin(2*pi*" + str(FREQ_HZ) + "Hz*time)",
-        TX_POINT_OUT)
-    if RX_TERMINAL_SHEETS:
-        # Zero net current models an unloaded pickup, not a short circuit.
-        assign_winding(oBoundary, "RX_Winding", RX_TERMINAL_SHEETS,
-                       "0A", RX_POINT_OUT)
+    if SOLUTION_TYPE == "EddyCurrent":
+        if len(TX_TERMINAL_SHEETS) != 1:
+            raise Exception("Frequency mode currently supports one TX conductor section. "
+                            "Do not select both ends or multiple spiral turns.")
+        oBoundary.AssignCurrent([
+            "NAME:TX_Current", "Objects:=", TX_TERMINAL_SHEETS,
+            "Current:=", str(CURRENT_PEAK_A) + "A", "Phase:=", "0deg",
+            "IsSolid:=", True, "Point out of terminal:=", TX_POINT_OUT])
+        if RX_TERMINAL_SHEETS:
+            raise Exception("Frequency mode currently supports a single-coil impedance sensor. "
+                            "RX voltage needs a separately validated open-circuit winding model; "
+                            "use Transient mode or configure that model before solving.")
+        oDesign.GetModule("MaxwellParameterSetup").AssignMatrix([
+            "NAME:SensorMatrix", ["NAME:MatrixEntry",
+             ["NAME:MatrixEntry", "Source:=", "TX_Current", "NumberOfTurns:=", "1"]],
+            ["NAME:MatrixGroup"]])
     else:
-        log("RX not configured: excitation/field model only; no pickup voltage.")
+        assign_winding(oBoundary, "TX_Winding", TX_TERMINAL_SHEETS,
+            str(CURRENT_PEAK_A) + "A*sin(2*pi*" + str(FREQ_HZ) + "Hz*time)",
+            TX_POINT_OUT)
+        if RX_TERMINAL_SHEETS:
+            assign_winding(oBoundary, "RX_Winding", RX_TERMINAL_SHEETS,
+                           "0A", RX_POINT_OUT)
     # Include induced currents in copper and specimen for the solid model.
     eddy_settings = ["NAME:Eddy Effect Setting"]
-    for obj in MATERIAL_OBJECTS["copper"] + MATERIAL_OBJECTS["C45"]:
+    for obj in MATERIAL_OBJECTS["copper"] + MATERIAL_OBJECTS["C45"] + MATERIAL_OBJECTS["aluminum"]:
         eddy_settings.append(["NAME:Data", "Object Name:=", obj,
                               "Eddy Effect:=", True])
     oBoundary.SetEddyEffect(["NAME:Eddy Effect Setting Vector", eddy_settings])
@@ -341,6 +428,13 @@ try:
     # ------------------------- MESH -------------------------
     oMesh = oDesign.GetModule("MeshSetup")
 
+    copper_skin = skin_depth_mm(highest_frequency, 1.0, 5.8e7)
+    copper_length = min(float(COPPER_MAX_LENGTH[:-2]),
+                        COPPER_THICKNESS_MM / 2.0,
+                        copper_skin / MESH_DIVISIONS_PER_SKIN_DEPTH)
+    copper_mesh_length = "%.8gmm" % copper_length
+    log("Highest frequency skin depth in copper: %.6g mm" % copper_skin)
+    log("Copper volume mesh limit: " + copper_mesh_length)
     copper_mesh_objects = MATERIAL_OBJECTS["copper"]
     if copper_mesh_objects:
         oMesh.AssignLengthOp(
@@ -349,60 +443,61 @@ try:
              "Objects:=", copper_mesh_objects,
              "RestrictElem:=", False,
              "RestrictLength:=", True,
-             "MaxLength:=", COPPER_MAX_LENGTH,
-             "ApplyToInitialMesh:=", True]
+             "MaxLength:=", copper_mesh_length]
         )
         log("Copper mesh operation assigned.")
 
-    steel_mesh_objects = MATERIAL_OBJECTS["C45"]
-    if steel_mesh_objects:
-        oMesh.AssignLengthOp(
-            ["NAME:C45_Mesh",
-             "RefineInside:=", True,
-             "Objects:=", steel_mesh_objects,
-             "RestrictElem:=", False,
-             "RestrictLength:=", True,
-             "MaxLength:=", STEEL_MAX_LENGTH,
-             "ApplyToInitialMesh:=", True]
-        )
-        log("C45 mesh operation assigned.")
+    for key in ("C45", "aluminum"):
+        if MATERIAL_OBJECTS[key]:
+            mu, sigma, unused = properties[key]
+            depth = skin_depth_mm(highest_frequency, float(mu), float(sigma))
+            length = min(float(STEEL_MAX_LENGTH[:-2]),
+                         depth / MESH_DIVISIONS_PER_SKIN_DEPTH)
+            log(key + " skin depth: %.6g mm; volume mesh limit: %.6g mm" % (depth, length))
+            oMesh.AssignLengthOp([
+                "NAME:" + key + "_Mesh", "RefineInside:=", True,
+                "Objects:=", MATERIAL_OBJECTS[key], "RestrictElem:=", False,
+                "RestrictLength:=", True, "MaxLength:=", "%.8gmm" % length])
 
     # ------------------------- TRANSIENT SETUP -------------------------
     oAnalysis = oDesign.GetModule("AnalysisSetup")
-    oAnalysis.InsertSetup(
-        "Transient",
-        ["NAME:Setup1",
-         "Enabled:=", True,
-         ["NAME:MeshLink", "ImportMesh:=", False],
-         "NonlinearSolverResidual:=", "0.005",
-         "ScalarPotential:=", "Second Order",
-         "SmoothBHCurve:=", False,
-         "StopTime:=", STOP_TIME,
-         "TimeStep:=", TIME_STEP,
-         "OutputError:=", False,
-         "OutputPerObjectCoreLoss:=", False,
-         "OutputPerObjectSolidLoss:=", False,
-         "UseControlProgram:=", False,
-         "ControlProgramName:=", "",
-         "ControlProgramArg:=", "",
-         "CallCtrlProgAfterLastStep:=", False,
-         "FastReachSteadyState:=", False,
-         "AutoDetectSteadyState:=", False,
-         "IsGeneralTransient:=", True,
-         "IsHalfPeriodicTransient:=", False,
-         "SaveFieldsType:=", "Every N Steps",
-         "NumberSolveSteps:=", 1,
-         "RangeStart:=", "0s",
-         "RangeEnd:=", STOP_TIME,
-         "ContinuumAir:=", False]
-    )
-    log("Transient setup created.")
+    if SOLUTION_TYPE == "EddyCurrent":
+        setup_names = insert_frequency_setups(oAnalysis, frequencies)
+        log("Frequency sweep: " + ", ".join("%.8g Hz" % f for f in frequencies))
+    else:
+        setup_names = ["Setup1"]
+        oAnalysis.InsertSetup(
+            "Transient",
+            ["NAME:Setup1",
+             "Enabled:=", True,
+             ["NAME:MeshLink", "ImportMesh:=", False],
+             "NonlinearSolverResidual:=", "0.005",
+             "ScalarPotential:=", "Second Order",
+             "SmoothBHCurve:=", False,
+             "StopTime:=", "%.12gs" % (float(TRANSIENT_CYCLES) / FREQ_HZ),
+             "TimeStep:=", "%.12gs" % (1.0 / (TRANSIENT_STEPS_PER_CYCLE * FREQ_HZ)),
+             "OutputError:=", False,
+             "OutputPerObjectCoreLoss:=", False,
+             "OutputPerObjectSolidLoss:=", False,
+             "UseControlProgram:=", False,
+             "ControlProgramName:=", "",
+             "ControlProgramArg:=", "",
+             "CallCtrlProgAfterLastStep:=", False,
+             "FastReachSteadyState:=", False,
+             "AutoDetectSteadyState:=", False,
+             "SaveFieldsType:=", "Every N Steps",
+             "NumberSolveSteps:=", 1,
+             "RangeStart:=", "0s",
+             "RangeEnd:=", "%.12gs" % (float(TRANSIENT_CYCLES) / FREQ_HZ)]
+        )
+        log("Transient setup created.")
 
     # Save project before solving.
     output_dir = OUTPUT_DIRECTORY or os.path.dirname(geometry_file)
     if not os.path.isdir(output_dir):
         raise Exception("Output directory does not exist: " + output_dir)
-    project_file = os.path.join(output_dir, PROJECT_NAME + ".aedt")
+    project_file = os.path.join(output_dir, PROJECT_NAME + "_" +
+                                datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".aedt")
     if os.path.exists(project_file):
         raise Exception("Output already exists; choose another PROJECT_NAME: " + project_file)
     oProject.SaveAs(project_file, False)
@@ -415,15 +510,22 @@ try:
                         "). Inspect AEDT Message Manager; solve blocked.")
     log("Design validation passed.")
     if AUTO_SOLVE:
-        oDesign.Analyze("Setup1")
+        for setup_name in setup_names:
+            oDesign.Analyze(setup_name)
         oProject.Save()
         log("Solver returned. Check convergence and solution messages in AEDT.")
     else:
         log("Saved, not solved. Inspect coil orientation, conductor continuity, "
             "lift-off, defect geometry and outer boundary before enabling AUTO_SOLVE.")
-    log("For RX use induced winding voltage versus time; compare identical "
-        "defect/no-defect cases after startup transients decay. Check mesh, "
-        "time-step and air-region convergence. C45 uses constant mu only.")
+    if SOLUTION_TYPE == "EddyCurrent":
+        log("Results: Results > Create EddyCurrent Report > Data Table; "
+            "select SensorMatrix R/L for TX_Current for each Freq_* setup. "
+            "Calculate Z = R + j*2*pi*f*L with L in henries. "
+            "Compare defect/no-defect cases at identical frequencies.")
+    log("Check adaptive convergence at EVERY frequency; reaching max passes is "
+        "not convergence. Compare finer meshes and larger air regions. "
+        "This is a magnetoquasistatic model; it omits PCB parasitic capacitance "
+        "and self resonance. Use HFSS for resonant/full-wave behavior.")
 
 except Exception as e:
     log("ERROR: " + str(e))
