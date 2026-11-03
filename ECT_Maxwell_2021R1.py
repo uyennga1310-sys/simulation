@@ -125,10 +125,12 @@ try:
         log("No geometry selected. Script stopped.")
         raise Exception("Geometry selection cancelled.")
 
-    geometry_file = dlg.FileName
+    geometry_file = str(dlg.FileName)
     if not os.path.isfile(geometry_file):
         raise Exception("Geometry file not found: " + geometry_file)
 
+    if os.path.splitext(geometry_file)[1].lower() not in (".x_t", ".x_b"):
+        raise Exception("Select a Parasolid .x_t or .x_b file, not a renamed CAD file.")
     log("Geometry: " + geometry_file)
 
     # Create project/design
@@ -140,14 +142,24 @@ try:
         ["NAME:Units Parameter", "Units:=", MODEL_UNITS, "Rescale:=", False]
     )
 
-    # Import Parasolid. Parasolid is supported by Maxwell 3D.
-    # If your 2021 R1 installation records a different import argument
-    # structure, use Record Script while importing the same .x_t once and
-    # replace this Import call with the recorded command.
-    oEditor.Import(
-        ["NAME:NativeBodyParameters",
-         "FileName:=", geometry_file]
-    )
+    # The native CAD importer takes SourceFile, not FileName. With FileName
+    # the importer can receive an empty source and report unsupported format.
+    try:
+        oEditor.Import(
+            ["NAME:NativeBodyParameters",
+             "HealOption:=", 0,
+             "Options:=", "",
+             "FileType:=", "UnRecognized",
+             "MaxStitchTol:=", -1,
+             "ImportFreeSurfaces:=", True,
+             "SourceFile:=", geometry_file])
+    except Exception as import_error:
+        log("CAD import failed: " + geometry_file)
+        log("Try Modeler > Import with this same file in AEDT 2021 R1. "
+            "If manual import also fails, check the CAD translator and "
+            "re-export to a Parasolid version supported by your installation. "
+            "Renaming the file extension does not convert the model.")
+        raise
     log("Parasolid import command sent.")
 
     # List imported solids/sheets so object names can be mapped correctly.
