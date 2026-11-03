@@ -8,7 +8,8 @@
 # IMPORTANT:
 # 1) Select your Parasolid .x_t file when the dialog opens.
 # 2) After import, check the object names printed in the Message Manager.
-# 3) Edit MATERIAL_OBJECTS and TX_TERMINAL_SHEETS below to match your geometry.
+# 3) Materials/terminal names are detected automatically when unambiguous.
+#    Ambiguous objects use selection dialogs; no source-code editing required.
 # 4) Settings below are examples, not calibrated sensor parameters.
 #    This is an eddy-current TX/RX sensor model, not capacitive ECT.
 # 5) Use solid copper traces with actual PCB copper thickness; represent
@@ -16,11 +17,13 @@
 # 6) Run with IronPython inside AEDT 2021 R1, not CPython/PyAEDT.
 
 import os
+import re
 import System
 import clr
 
 clr.AddReference("System.Windows.Forms")
-from System.Windows.Forms import OpenFileDialog, DialogResult
+from System.Windows.Forms import (OpenFileDialog, DialogResult, Form, Label,
+                                  ComboBox, ComboBoxStyle, Button)
 
 # ------------------------- USER SETTINGS -------------------------
 
@@ -91,6 +94,92 @@ def assign_material(editor, object_names, material_name):
              "SolveInside:=", True]
         )
         log("Assigned " + material_name + " -> " + obj)
+
+def choose_role(object_name, roles, description):
+    dialog = Form()
+    dialog.Text = "ECT - " + object_name
+    dialog.Width = 640
+    dialog.Height = 230
+    label = Label()
+    label.Text = description + "\nObject: " + object_name
+    label.Left, label.Top, label.Width, label.Height = 15, 15, 590, 85
+    choice = ComboBox()
+    choice.Left, choice.Top, choice.Width = 15, 105, 590
+    choice.DropDownStyle = ComboBoxStyle.DropDownList
+    for role in roles:
+        choice.Items.Add(role)
+    # No preselected physical role: generic names do not identify a material.
+    button = Button()
+    button.Text = "OK"
+    button.Left, button.Top = 510, 145
+    button.DialogResult = DialogResult.OK
+    dialog.Controls.Add(label)
+    dialog.Controls.Add(choice)
+    dialog.Controls.Add(button)
+    dialog.AcceptButton = button
+    try:
+        if dialog.ShowDialog() != DialogResult.OK or choice.SelectedIndex < 0:
+            raise Exception("Object mapping cancelled: " + object_name)
+        return str(choice.SelectedItem)
+    finally:
+        dialog.Dispose()
+
+
+def detect_material(name, imported_material):
+    tokens = set(re.findall(r"[a-z0-9]+", name.lower()))
+    material = imported_material.lower().strip('" ')
+    candidates = set()
+    if material == "copper" or tokens & set(["copper", "cu", "tx", "rx", "coil", "trace"]):
+        candidates.add("copper")
+    if material in ("fr4", "fr4_epoxy") or tokens & set(["fr4", "substrate", "dielectric"]):
+        candidates.add("FR4_epoxy")
+    if material == "c45" or tokens & set(["c45", "specimen", "sample"]):
+        candidates.add("C45")
+    return list(candidates)[0] if len(candidates) == 1 else None
+
+
+def populate_mapping(editor, solids, sheets):
+    assigned = set(obj for objects in MATERIAL_OBJECTS.values() for obj in objects)
+    for obj in solids:
+        if obj in assigned:
+            continue
+        try:
+            imported_material = str(editor.GetPropertyValue(
+                "Geometry3DAttributeTab", obj, "Material"))
+        except Exception:
+            imported_material = ""
+        role = detect_material(obj, imported_material)
+        if role is None:
+            role = choose_role(obj, ["copper", "FR4_epoxy", "C45"],
+                "Select the actual material. Copper = PCB conductors; "
+                "FR4 = substrate; C45 = steel specimen. "
+                "If this is another part, cancel and configure its material separately.")
+        MATERIAL_OBJECTS[role].append(obj)
+        log("Material mapping: " + obj + " -> " + role)
+    # Only terminal-labelled sheets are eligible for automatic terminal mapping.
+    # Do not assign an arbitrary PCB face or every sheet as a coil cross-section.
+    for sheet in sheets:
+        if sheet in TX_TERMINAL_SHEETS + RX_TERMINAL_SHEETS:
+            continue
+        tokens = set(re.findall(r"[a-z0-9]+", sheet.lower()))
+        terminal = bool(tokens & set(["terminal", "section", "cutsection"]))
+        if terminal and "tx" in tokens and "rx" not in tokens:
+            role = "TX terminal"
+        elif terminal and "rx" in tokens and "tx" not in tokens:
+            role = "RX terminal"
+        else:
+            role = choose_role(sheet, ["Unused sheet", "TX terminal", "RX terminal"],
+                "Select TX/RX only for a conductor cross-section sheet. "
+                "Use one section per independent conductor, not both ends.")
+        if role == "TX terminal":
+            TX_TERMINAL_SHEETS.append(sheet)
+        elif role == "RX terminal":
+            RX_TERMINAL_SHEETS.append(sheet)
+    if not sheets and not TX_TERMINAL_SHEETS:
+        raise Exception("CAD imported solids only. In Maxwell create a cross-section "
+                        "sheet for TX; a terminal cannot be inferred from an arbitrary face. "
+                        "Export/include the terminal sheet in the CAD input before rerunning.")
+
 
 def assign_winding(boundary, name, sheets, current, point_out):
     # Maxwell 3D transient: sheet coil terminals belong to a winding.
@@ -178,11 +267,12 @@ try:
     # Refuse an incomplete model rather than solving unassigned imported bodies.
     if not solid_names:
         raise Exception("No solids imported. Check Parasolid version/units.")
+    populate_mapping(oEditor, solid_names, sheet_names)
     if not MATERIAL_OBJECTS["copper"] or not MATERIAL_OBJECTS["C45"]:
-        raise Exception("Set copper and C45 object names in MATERIAL_OBJECTS; "
-                        "see imported names above. No solve performed.")
+        raise Exception("Mapping must include copper conductors and a C45 specimen. "
+                        "Check the selected roles and imported geometry.")
     if not TX_TERMINAL_SHEETS:
-        raise Exception("Configure TX_TERMINAL_SHEETS with conductor cross-section sheets.")
+        raise Exception("No TX cross-section sheet selected. A valid TX terminal is required.")
     mapped = []
     for material, objects in MATERIAL_OBJECTS.items():
         for obj in objects:
